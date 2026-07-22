@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "startup": {},
+  "skills": {
+    "preloaded": [
+      "apply-locally",
+      "banner-design",
+      "brainstorm",
+      "brand",
+      "commit",
+      "derisk",
+      "design-system",
+      "find-skills",
+      "explain",
+      "design",
+      "ui-styling",
+      "ui-ux-pro-max",
+      "preview",
+      "gsap-frameworks",
+      "gsap-core",
+      "gsap-plugins",
+      "gsap-performance",
+      "gsap-utils",
+      "gsap-timeline",
+      "gsap-scrolltrigger",
+      "overhaul",
+      "merge-local",
+      "gsap-react",
+      "open-pr",
+      "merge-pr",
+      "review",
+      "simplify",
+      "test"
+    ]
+  }
+}

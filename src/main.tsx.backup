@@ -1,0 +1,1309 @@
+import React, { useEffect, useMemo, useState, Component } from 'react';
+import { createRoot } from 'react-dom/client';
+import { motion, AnimatePresence } from 'framer-motion';
+import './styles.css';
+import './styles-enhanced.css';
+import { CountdownTimer } from './components/CountdownTimer';
+import { VerdictReveal } from './components/VerdictReveal';
+import { NewDuelModal } from './components/NewDuelModal';
+import { Leaderboard as LeaderboardComponent } from './components/Leaderboard';
+import { PendingAcceptance as PendingAcceptanceComponent } from './components/PendingAcceptance';
+import { CharacterCounter } from './components/CharacterCounter';
+import { DuelsList } from './components/DuelsList';
+import { CombatCard } from './components/CombatCard';
+import { WalletConnect } from './components/WalletConnect';
+import { WalletProvider, useWallet } from './contexts/WalletContext';
+import { contract, type ContractDuel, type ContractDebater, CONTRACT_CONSTANTS, type TransactionError } from './lib/contract';
+
+console.log('[main.tsx] Module loaded');
+
+
+type View = 'home' | 'trending' | 'my-combats' | 'start-combat' | 'leaderboard';
+
+type Duel = ContractDuel & {
+  playerSide: 'pro' | 'con';
+  opponentName: string;
+  timeRemaining: number;
+};
+
+type Debater = {
+  address: string;
+  name: string;
+  wins: number;
+  losses: number;
+  draws: number;
+  bestVerdictQuote: string;
+};
+
+function App() {
+  console.log('[App] Component rendering');
+  return (
+    <div style={{ padding: '20px', background: 'white', color: 'black' }}>
+      <h1>App is rendering</h1>
+      <p>If you see this, React is working</p>
+    </div>
+  );
+}
+
+  // Load data from contract on mount and when wallet connects
+  useEffect(() => {
+    const loadData = async () => {
+      setIsLoadingDuels(true);
+      try {
+        console.log('Starting contract data load...');
+        const [leaderboard, duels] = await Promise.all([
+          contract.getLeaderboard(50).then(result => { console.log('getLeaderboard succeeded:', result); return result; }),
+          contract.getAllDuels().then(result => { console.log('getAllDuels succeeded:', result); return result; }),
+        ]);
+        console.log('Contract data loaded successfully');
+        setLeaderboardData(leaderboard.map(d => ({
+          address: d.address,
+          name: shortAddress(d.address),
+          wins: d.wins,
+          losses: d.losses,
+          draws: d.draws,
+          bestVerdictQuote: d.best_verdict_quote,
+        })));
+        setAllDuels(duels);
+      } catch (err) {
+        console.error('Failed to load contract data - FULL ERROR:', err);
+        console.error('Error stack:', err instanceof Error ? err.stack : 'No stack trace');
+        setError('Failed to load data from contract');
+      } finally {
+        setIsLoadingDuels(false);
+      }
+    };
+    loadData();
+  }, []);
+
+  const leaderboard = useMemo(() => {
+    if (!walletAddress || !duel || duel.status !== 'judged') return leaderboardData;
+
+    const isWinner = duel.playerSide === duel.winner;
+    return [
+      {
+        address: walletAddress,
+        name: 'You',
+        wins: isWinner ? 1 : 0,
+        losses: isWinner ? 0 : 1,
+        draws: 0,
+        bestVerdictQuote: duel.verdict_reasoning || 'No verdict quote yet.',
+      },
+      ...leaderboardData,
+    ].sort((a, b) => winRate(b) - winRate(a));
+  }, [duel, walletAddress, leaderboardData]);
+
+  const { getAccount } = useWallet();
+
+  const submitArgument = async () => {
+    if (!duel || draft.trim().length < CONTRACT_CONSTANTS.MIN_ARGUMENT_LENGTH) return;
+    const account = getAccount();
+    if (!account) {
+      setError('Please connect your wallet to submit an argument');
+      return;
+    }
+    try {
+      setIsLoading(true);
+      setError(null);
+      setTransactionError(null);
+      const txHash = await contract.submitArgument(account.walletClient, account.address, duel.id, draft.trim());
+      setTransactionStatus({ hash: txHash, status: 'pending' });
+      
+      // Poll for transaction confirmation
+      const pollInterval = setInterval(async () => {
+        const status = await contract.getTransactionStatus(txHash);
+        if (status.status !== 'pending') {
+          clearInterval(pollInterval);
+          setTransactionStatus({ hash: txHash, status: status.status });
+          if (status.status === 'confirmed') {
+            // Refresh duel and all duels on success
+            const [updatedDuel, updatedDuels] = await Promise.all([
+              contract.getDuel(duel.id),
+              contract.getAllDuels(),
+            ]);
+            const now = Math.floor(Date.now() / 1000);
+            setDuel({
+              ...updatedDuel,
+              playerSide: duel.playerSide,
+              opponentName: duel.opponentName,
+              timeRemaining: Math.max(0, updatedDuel.submit_deadline - now),
+            });
+            setAllDuels(updatedDuels);
+            setDraft('');
+          }
+        }
+      }, 2000);
+    } catch (err) {
+      console.error('Failed to submit argument:', err);
+      if (err && typeof err === 'object' && 'name' in err) {
+        const txError = err as TransactionError;
+        setTransactionError(txError);
+        setError(txError.message || 'Failed to submit argument');
+      } else {
+        setError('Failed to submit argument');
+      }
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const evaluateDuel = async () => {
+    if (!duel) return;
+    const account = getAccount();
+    if (!account) {
+      setError('Please connect your wallet to evaluate this duel');
+      return;
+    }
+    try {
+      setIsLoading(true);
+      setError(null);
+      setTransactionError(null);
+      const txHash = await contract.judgeDuel(account.walletClient, account.address, duel.id);
+      setTransactionStatus({ hash: txHash, status: 'pending' });
+      
+      // Poll for transaction confirmation
+      const pollInterval = setInterval(async () => {
+        const status = await contract.getTransactionStatus(txHash);
+        if (status.status !== 'pending') {
+          clearInterval(pollInterval);
+          setTransactionStatus({ hash: txHash, status: status.status });
+          if (status.status === 'confirmed') {
+            // Refresh duel and all duels on success
+            const [updatedDuel, updatedDuels] = await Promise.all([
+              contract.getDuel(duel.id),
+              contract.getAllDuels(),
+            ]);
+            const now = Math.floor(Date.now() / 1000);
+            setDuel({
+              ...updatedDuel,
+              playerSide: duel.playerSide,
+              opponentName: duel.opponentName,
+              timeRemaining: Math.max(0, updatedDuel.submit_deadline - now),
+            });
+            setAllDuels(updatedDuels);
+          }
+        }
+      }, 2000);
+    } catch (err) {
+      console.error('Failed to evaluate duel:', err);
+      if (err && typeof err === 'object' && 'name' in err) {
+        const txError = err as TransactionError;
+        setTransactionError(txError);
+        setError(txError.message || 'Failed to evaluate duel');
+      } else {
+        setError('Failed to evaluate duel');
+      }
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const joinDuel = async (duelId: number, stake: number) => {
+    const account = getAccount();
+    if (!account) {
+      setError('Please connect your wallet to join this duel');
+      return;
+    }
+    try {
+      setIsLoading(true);
+      setError(null);
+      setTransactionError(null);
+      const txHash = await contract.joinDuel(account.walletClient, account.address, duelId, stake);
+      setTransactionStatus({ hash: txHash, status: 'pending' });
+      
+      // Poll for transaction confirmation
+      const pollInterval = setInterval(async () => {
+        const status = await contract.getTransactionStatus(txHash);
+        if (status.status !== 'pending') {
+          clearInterval(pollInterval);
+          setTransactionStatus({ hash: txHash, status: status.status });
+          if (status.status === 'confirmed') {
+            // Refresh all duels on success
+            const updatedDuels = await contract.getAllDuels();
+            setAllDuels(updatedDuels);
+          }
+        }
+      }, 2000);
+    } catch (err) {
+      console.error('Failed to join duel:', err);
+      if (err && typeof err === 'object' && 'name' in err) {
+        const txError = err as TransactionError;
+        setTransactionError(txError);
+        setError(txError.message || 'Failed to join duel');
+      } else {
+        setError('Failed to join duel');
+      }
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const expireDuel = async (duelId: number) => {
+    const account = getAccount();
+    if (!account) {
+      setError('Please connect your wallet to expire this duel');
+      return;
+    }
+    try {
+      setIsLoading(true);
+      setError(null);
+      setTransactionError(null);
+      const txHash = await contract.expireDuel(account.walletClient, account.address, duelId);
+      setTransactionStatus({ hash: txHash, status: 'pending' });
+      
+      // Poll for transaction confirmation
+      const pollInterval = setInterval(async () => {
+        const status = await contract.getTransactionStatus(txHash);
+        if (status.status !== 'pending') {
+          clearInterval(pollInterval);
+          setTransactionStatus({ hash: txHash, status: status.status });
+          if (status.status === 'confirmed') {
+            // Refresh duel and all duels on success
+            const [updatedDuel, updatedDuels] = await Promise.all([
+              contract.getDuel(duelId),
+              contract.getAllDuels(),
+            ]);
+            // Only update current duel if it exists and matches the expired duel
+            if (duel && duel.id === duelId) {
+              const now = Math.floor(Date.now() / 1000);
+              setDuel({
+                ...updatedDuel,
+                playerSide: duel.playerSide,
+                opponentName: duel.opponentName,
+                timeRemaining: Math.max(0, updatedDuel.submit_deadline - now),
+              });
+            }
+            setAllDuels(updatedDuels);
+          }
+        }
+      }, 2000);
+    } catch (err) {
+      console.error('Failed to expire duel:', err);
+      if (err && typeof err === 'object' && 'name' in err) {
+        const txError = err as TransactionError;
+        setTransactionError(txError);
+        setError(txError.message || 'Failed to expire duel');
+      } else {
+        setError('Failed to expire duel');
+      }
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const createNewDuel = async (topic: string, category: string, stake: number, joinDeadline: number, submitDuration: number) => {
+    const account = getAccount();
+    if (!account) {
+      setError('Please connect your wallet to create a duel');
+      return;
+    }
+    try {
+      setIsLoading(true);
+      setError(null);
+      setTransactionError(null);
+      const txHash = await contract.createDuel(account.walletClient, account.address, topic, category, stake, joinDeadline, submitDuration);
+      setTransactionStatus({ hash: txHash, status: 'pending' });
+      
+      // Poll for transaction confirmation
+      const pollInterval = setInterval(async () => {
+        const status = await contract.getTransactionStatus(txHash);
+        if (status.status !== 'pending') {
+          clearInterval(pollInterval);
+          setTransactionStatus({ hash: txHash, status: status.status });
+          if (status.status === 'confirmed') {
+            // Refresh all duels on success
+            const updatedDuels = await contract.getAllDuels();
+            setAllDuels(updatedDuels);
+            setShowCreate(false);
+          }
+        }
+      }, 2000);
+    } catch (err) {
+      console.error('Failed to create duel:', err);
+      if (err && typeof err === 'object' && 'name' in err) {
+        const txError = err as TransactionError;
+        setTransactionError(txError);
+        setError(txError.message || 'Failed to create duel');
+      } else {
+        setError('Failed to create duel');
+      }
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <main className="app">
+      <AppNav
+        view={view}
+        walletAddress={walletAddress}
+        onView={setView}
+        onNewDuel={() => setShowCreate(true)}
+      />
+
+      <AnimatePresence mode="wait">
+        {view === 'home' && duel && (
+          <motion.div
+            key="combat-detail"
+            initial={{ opacity: 0, x: -20 }}
+            animate={{ opacity: 1, x: 0 }}
+            exit={{ opacity: 0, x: 20 }}
+            transition={{ duration: 0.3 }}
+          >
+            <CombatDetail
+              duel={duel}
+              walletAddress={walletAddress}
+              draft={draft}
+              onDraft={setDraft}
+              onSubmit={submitArgument}
+              onEvaluate={evaluateDuel}
+              onForfeit={() => setShowForfeit(true)}
+              transactionStatus={transactionStatus}
+            />
+          </motion.div>
+        )}
+        {view === 'home' && !duel && (
+          <motion.div
+            key="home-feed"
+            className="home-feed"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.3 }}
+          >
+            <section className="home-section">
+              <div className="section-header">
+                <h2>Trending Combats</h2>
+                <button className="link-btn" onClick={() => setView('trending')}>View All</button>
+              </div>
+              <div className="home-combats-grid">
+                {allDuels.filter(d => d.status === 'judged').slice(0, 3).map((duel, index) => (
+                  <CombatCard
+                    key={duel.id}
+                    duel={duel}
+                    walletAddress={walletAddress}
+                    onSelect={() => {
+                      const now = Math.floor(Date.now() / 1000);
+                      setDuel({
+                        ...duel,
+                        playerSide: duel.creator === walletAddress ? 'pro' : 'con',
+                        opponentName: 'Opponent',
+                        timeRemaining: Math.max(0, duel.join_deadline - now),
+                      });
+                    }}
+                    index={index}
+                  />
+                ))}
+                {allDuels.filter(d => d.status === 'judged').length === 0 && (
+                  <div className="empty-state">No judged combats yet</div>
+                )}
+              </div>
+            </section>
+
+            <section className="home-section">
+              <div className="section-header">
+                <h2>Live Combats</h2>
+                <button className="link-btn" onClick={() => setView('trending')}>View All</button>
+              </div>
+              <div className="home-combats-grid">
+                {allDuels.filter(d => d.status === 'active' || d.status === 'submitted').slice(0, 3).map((duel, index) => (
+                  <CombatCard
+                    key={duel.id}
+                    duel={duel}
+                    walletAddress={walletAddress}
+                    onSelect={() => {
+                      const now = Math.floor(Date.now() / 1000);
+                      setDuel({
+                        ...duel,
+                        playerSide: duel.creator === walletAddress ? 'pro' : 'con',
+                        opponentName: 'Opponent',
+                        timeRemaining: Math.max(0, duel.join_deadline - now),
+                      });
+                    }}
+                    index={index}
+                  />
+                ))}
+                {allDuels.filter(d => d.status === 'active' || d.status === 'submitted').length === 0 && (
+                  <div className="empty-state">No live combats</div>
+                )}
+              </div>
+            </section>
+
+            <section className="home-section">
+              <div className="section-header">
+                <h2>Leaderboard</h2>
+                <button className="link-btn" onClick={() => setView('leaderboard')}>View All</button>
+              </div>
+              <div className="leaderboard-teaser">
+                {leaderboardData.slice(0, 5).map((row, index) => (
+                  <div key={row.address} className={`leader-row-teaser ${walletAddress && row.address === walletAddress ? 'current' : ''}`}>
+                    <span className="rank">#{index + 1}</span>
+                    <span className="name">{row.name}</span>
+                    <span className="stats">{row.wins}W - {row.losses}L</span>
+                  </div>
+                ))}
+                {leaderboardData.length === 0 && (
+                  <div className="empty-state">No leaderboard data</div>
+                )}
+              </div>
+            </section>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {error && (
+        <motion.div
+          className="error-banner"
+          initial={{ opacity: 0, y: -20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.3 }}
+        >
+          {error}
+          <button onClick={() => setError(null)}>×</button>
+        </motion.div>
+      )}
+
+      <AnimatePresence mode="wait">
+        {view === 'trending' && (
+          <motion.div
+            key="trending"
+            initial={{ opacity: 0, x: -20 }}
+            animate={{ opacity: 1, x: 0 }}
+            exit={{ opacity: 0, x: 20 }}
+            transition={{ duration: 0.3 }}
+          >
+            <DuelsList
+              duels={allDuels}
+              walletAddress={walletAddress}
+              isLoading={isLoadingDuels}
+              filter="trending"
+              onSelectDuel={(selectedDuel: ContractDuel) => {
+                const now = Math.floor(Date.now() / 1000);
+                setDuel({
+                  ...selectedDuel,
+                  playerSide: selectedDuel.creator === walletAddress ? 'pro' : 'con',
+                  opponentName: 'Opponent',
+                  timeRemaining: Math.max(0, selectedDuel.join_deadline - now),
+                });
+                setView('home');
+              }}
+              onJoinDuel={joinDuel}
+            />
+          </motion.div>
+        )}
+        {view === 'my-combats' && (
+          <motion.div
+            key="my-combats"
+            initial={{ opacity: 0, x: -20 }}
+            animate={{ opacity: 1, x: 0 }}
+            exit={{ opacity: 0, x: 20 }}
+            transition={{ duration: 0.3 }}
+          >
+            <DuelsList
+              duels={allDuels}
+              walletAddress={walletAddress}
+              isLoading={isLoadingDuels}
+              filter="my-combats"
+              onSelectDuel={(selectedDuel: ContractDuel) => {
+                const now = Math.floor(Date.now() / 1000);
+                setDuel({
+                  ...selectedDuel,
+                  playerSide: selectedDuel.creator === walletAddress ? 'pro' : 'con',
+                  opponentName: 'Opponent',
+                  timeRemaining: Math.max(0, selectedDuel.join_deadline - now),
+                });
+                setView('home');
+              }}
+              onJoinDuel={joinDuel}
+              onStartCombat={() => setView('start-combat')}
+            />
+          </motion.div>
+        )}
+        {view === 'leaderboard' && (
+          <motion.div
+            key="leaderboard"
+            initial={{ opacity: 0, x: -20 }}
+            animate={{ opacity: 1, x: 0 }}
+            exit={{ opacity: 0, x: 20 }}
+            transition={{ duration: 0.3 }}
+          >
+            <LeaderboardComponent
+              debaters={leaderboard.map(row => ({
+                address: row.address,
+                wins: row.wins,
+                losses: row.losses,
+                draws: row.draws,
+                total_score: row.wins * 100,
+                debates_played: row.wins + row.losses + row.draws,
+                best_verdict_quote: row.bestVerdictQuote,
+              }))}
+              currentAddress={walletAddress || undefined}
+            />
+          </motion.div>
+        )}
+        {view === 'start-combat' && (
+          <motion.div
+            key="start-combat"
+            className="start-combat-container"
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.95 }}
+            transition={{ duration: 0.3, ease: [0.4, 0, 0.2, 1] }}
+          >
+            {!walletAddress ? (
+              <div className="empty-state">
+                <h3>Connect Your Wallet</h3>
+                <p>Connect your wallet to start a new combat.</p>
+              </div>
+            ) : (
+              <NewDuelModal
+                isOpen={true}
+                onClose={() => setView('home')}
+                onCreate={createNewDuel}
+              />
+            )}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {showCreate && <NewDuelModal isOpen={showCreate} onClose={() => setShowCreate(false)} onCreate={createNewDuel} />}
+      {showForfeit && duel && <ForfeitModal onClose={() => setShowForfeit(false)} onConfirm={() => { setShowForfeit(false); expireDuel(duel.id); }} />}
+      {transactionStatus && <TransactionStatus status={transactionStatus} onClose={() => setTransactionStatus(null)} />}
+      {transactionError && <TransactionErrorModal error={transactionError} onClose={() => setTransactionError(null)} />}
+    </main>
+  );
+}
+
+function AppNav({
+  view,
+  walletAddress,
+  onView,
+  onNewDuel,
+}: {
+  view: View;
+  walletAddress: string | null;
+  onView: (view: View) => void;
+  onNewDuel: () => void;
+}) {
+  return (
+    <header className="topbar">
+      <div className="nav-inner">
+        <button className="brand" onClick={() => onView('home')}>
+          <LogoMark />
+          <span>THE VERDICT</span>
+        </button>
+        <nav>
+          <button className={view === 'home' ? 'active' : ''} onClick={() => onView('home')}>
+            Home
+          </button>
+          <button className={view === 'trending' ? 'active' : ''} onClick={() => onView('trending')}>
+            Trending
+          </button>
+          <button className={view === 'my-combats' ? 'active' : ''} onClick={() => onView('my-combats')}>
+            My Combats
+          </button>
+          <button className={view === 'leaderboard' ? 'active' : ''} onClick={() => onView('leaderboard')}>
+            Leaderboard
+          </button>
+        </nav>
+        <div className="nav-actions">
+          <button className="btn-primary" onClick={() => onView('start-combat')}>
+            Start Combat
+          </button>
+          <WalletConnect />
+        </div>
+      </div>
+    </header>
+  );
+}
+
+function CombatDetail({
+  duel,
+  walletAddress,
+  draft,
+  onDraft,
+  onSubmit,
+  onEvaluate,
+  onForfeit,
+  transactionStatus,
+}: {
+  duel: Duel;
+  walletAddress: string | null;
+  draft: string;
+  onDraft: (value: string) => void;
+  onSubmit: () => void;
+  onEvaluate: () => void;
+  onForfeit: () => void;
+  transactionStatus: { hash: string; status: 'pending' | 'confirmed' | 'failed' } | null;
+}) {
+  const now = Math.floor(Date.now() / 1000);
+
+  // Action eligibility checks using only contract fields
+  const canJoin = duel.status === 'open' && walletAddress && duel.creator !== walletAddress;
+  const canSubmit = duel.status === 'active' && walletAddress &&
+    ((duel.pro_player === walletAddress && !duel.pro_argument) ||
+     (duel.con_player === walletAddress && !duel.con_argument));
+  const canJudge = duel.status === 'submitted' && walletAddress &&
+    duel.pro_argument && duel.con_argument;
+  const canExpire = (duel.status === 'open' || duel.status === 'active' || duel.status === 'submitted') &&
+    !duel.settled && (duel.join_deadline < now || duel.submit_deadline < now);
+
+  return (
+    <section className="combat-detail">
+      <DuelMeta duel={duel} walletAddress={walletAddress} />
+
+      {/* Open status - show join button if eligible, otherwise waiting */}
+      {duel.status === 'open' && (
+        <>
+          {canJoin && (
+            <section className="action-panel panel">
+              <h3>Join This Combat</h3>
+              <p>Stake: {(duel.stake / 1000000).toFixed(1)}M GEN</p>
+              <button className="btn-primary" onClick={onSubmit} disabled={transactionStatus !== null}>
+                {transactionStatus ? 'Processing...' : 'Join as CON'}
+              </button>
+            </section>
+          )}
+          {!canJoin && (
+            <PendingAcceptance duel={duel} onForfeit={onForfeit} />
+          )}
+        </>
+      )}
+
+      {/* Active status - show submit if eligible, otherwise waiting */}
+      {duel.status === 'active' && walletAddress && canSubmit && (
+        <AssignedDuel duel={duel} draft={draft} onDraft={onDraft} onSubmit={onSubmit} onForfeit={onForfeit} transactionStatus={transactionStatus} />
+      )}
+      {duel.status === 'active' && walletAddress && !canSubmit && (
+        <section className="action-panel panel">
+          <h3>Waiting for Opponent</h3>
+          <p>Your opponent is preparing their argument.</p>
+        </section>
+      )}
+      {duel.status === 'active' && !walletAddress && (
+        <section className="action-panel panel">
+          <h3>Connect to View Details</h3>
+          <p>Connect your wallet to see combat details.</p>
+        </section>
+      )}
+
+      {/* Submitted status - show judge if eligible, otherwise waiting */}
+      {duel.status === 'submitted' && canJudge && (
+        <SubmittedDuel duel={duel} onEvaluate={onEvaluate} transactionStatus={transactionStatus} />
+      )}
+      {duel.status === 'submitted' && !canJudge && (
+        <section className="action-panel panel">
+          <h3>Waiting for AI Judgment</h3>
+          <p>Both arguments submitted. AI is evaluating the combat.</p>
+        </section>
+      )}
+
+      {/* Judged status - show results */}
+      {duel.status === 'judged' && <CompletedDuel duel={duel} />}
+
+      {/* Expired status - show expiry reason */}
+      {duel.status === 'expired' && (
+        <section className="action-panel panel">
+          <h3>Combat Expired</h3>
+          <p>This combat expired due to missed deadlines.</p>
+          {duel.winner && <p className="winner-text">Winner: {duel.winner.toUpperCase()}</p>}
+        </section>
+      )}
+
+      {/* Expire action when eligible */}
+      {canExpire && (
+        <section className="action-panel panel warning">
+          <h3>Combat Can Be Expired</h3>
+          <p>Deadlines have passed. You can expire this combat.</p>
+          <button className="btn-primary" onClick={onForfeit} disabled={transactionStatus !== null}>
+            {transactionStatus ? 'Processing...' : 'Expire Combat'}
+          </button>
+        </section>
+      )}
+    </section>
+  );
+}
+
+function DuelMeta({ duel, walletAddress }: { duel: Duel; walletAddress: string | null }) {
+  const label =
+    !walletAddress
+      ? 'PENDING ACCEPTANCE'
+      : duel.status === 'active'
+      ? 'YOUR TURN'
+      : duel.status === 'submitted'
+        ? 'AWAITING JUDGMENT'
+        : duel.status === 'judged'
+          ? 'COMPLETED'
+          : duel.status === 'open'
+            ? 'OPEN FOR JOINING'
+            : 'EXPIRED';
+
+  return (
+    <div className="combat-detail-header">
+      <div className="combat-header-top">
+        <div className="combat-status-row">
+          <span className={`status-badge ${duel.status}`}>{label}</span>
+          <span className="combat-id">Combat #{duel.id}</span>
+        </div>
+        <div className="combat-meta-row">
+          <span className="category">{duel.category}</span>
+          <span className="stake">{(duel.stake / 1000000).toFixed(1)}M GEN</span>
+        </div>
+      </div>
+      <h1 className="combat-topic-large">{duel.topic}</h1>
+      <div className="combat-participants">
+        <div className="participant pro">
+          <span className="participant-label">PRO</span>
+          <span className="participant-address">{shortAddress(duel.pro_player)}</span>
+          {duel.pro_argument && <span className="participant-status">Submitted</span>}
+        </div>
+        {duel.has_con_player && (
+          <div className="participant con">
+            <span className="participant-label">CON</span>
+            <span className="participant-address">{shortAddress(duel.con_player)}</span>
+            {duel.con_argument && <span className="participant-status">Submitted</span>}
+          </div>
+        )}
+        {!duel.has_con_player && (
+          <div className="participant waiting">
+            <span className="participant-label">WAITING</span>
+            <span className="participant-address">No opponent yet</span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PendingAcceptance({ duel, onForfeit }: { duel: Duel; onForfeit: () => void }) {
+  const totalTime = duel.submit_deadline - duel.join_deadline;
+  return (
+    <PendingAcceptanceComponent
+      timeRemaining={duel.timeRemaining}
+      totalTime={totalTime}
+      opponentName={duel.opponentName}
+      onCancel={onForfeit}
+    />
+  );
+}
+
+function AssignedDuel({
+  duel,
+  draft,
+  onDraft,
+  onSubmit,
+  onForfeit,
+  transactionStatus,
+}: {
+  duel: Duel;
+  draft: string;
+  onDraft: (value: string) => void;
+  onSubmit: () => void;
+  onForfeit: () => void;
+  transactionStatus: { hash: string; status: 'pending' | 'confirmed' | 'failed' } | null;
+}) {
+  const canSubmit = draft.trim().length >= CONTRACT_CONSTANTS.MIN_ARGUMENT_LENGTH && draft.trim().length <= CONTRACT_CONSTANTS.MAX_ARGUMENT_LENGTH;
+
+  return (
+    <>
+      <section className="assignment-banner">
+        <span>You have been assigned</span>
+        <strong>{duel.playerSide.toUpperCase()}</strong>
+        <p>You must argue for the topic. Construct a compelling, evidence-based argument supporting this position.</p>
+      </section>
+      <div className="assignment-grid">
+        <TopicBlock topic={duel.topic} />
+        <section className="opponent-card panel">
+          <PlayerOrb label="CK" tone="con" />
+          <div>
+            <span>Opponent</span>
+            <strong>{duel.opponentName}</strong>
+            <em>Assigned: CON</em>
+            <div className="opponent-record">
+              <span>8W–2L</span>
+              <span>80% Win Rate</span>
+            </div>
+          </div>
+        </section>
+        <section className="timer-card panel">
+          <CountdownTimer
+            timeRemaining={duel.timeRemaining}
+            totalTime={duel.submit_deadline - duel.join_deadline}
+            isLow={duel.timeRemaining < 3600}
+          />
+          <span>Deadline</span>
+          <p>{new Date(duel.submit_deadline * 1000).toLocaleString()}</p>
+        </section>
+        <section className="stats-card panel">
+          <span>Duel Stake</span>
+          <strong>{(duel.stake / 1000000).toFixed(1)}M GEN</strong>
+          <span>Your Reputation</span>
+          <strong>85% Win Rate</strong>
+        </section>
+        <section className="draft-card panel">
+          <div className="draft-head">
+            <span>Draft your argument</span>
+            <CharacterCounter 
+              current={draft.length}
+              min={CONTRACT_CONSTANTS.MIN_ARGUMENT_LENGTH}
+              max={CONTRACT_CONSTANTS.MAX_ARGUMENT_LENGTH}
+            />
+          </div>
+          <textarea
+            data-testid="argument-input"
+            value={draft}
+            maxLength={CONTRACT_CONSTANTS.MAX_ARGUMENT_LENGTH}
+            placeholder="Build your case. Use evidence, logic, and rhetoric to argue your position..."
+            onChange={(event) => onDraft(event.target.value)}
+          />
+          <div className="draft-actions">
+            <button className="forfeit-link" onClick={onForfeit}>
+              Forfeit Combat
+            </button>
+            <button className="save-draft">Save Draft</button>
+            <button className="submit-argument" data-testid="submit-argument" disabled={!canSubmit || transactionStatus !== null} onClick={onSubmit}>
+              {transactionStatus ? 'Processing...' : 'Submit Argument'}
+            </button>
+          </div>
+        </section>
+      </div>
+    </>
+  );
+}
+
+function SubmittedDuel({ duel, onEvaluate, transactionStatus }: { duel: Duel; onEvaluate: () => void; transactionStatus: { hash: string; status: 'pending' | 'confirmed' | 'failed' } | null }) {
+  return (
+    <>
+      <section className="submitted-card panel">
+        <div className="submitted-head">
+          <span>Argument Submitted</span>
+          <p>Your argument is locked and encrypted. It will be revealed once both sides have submitted.</p>
+        </div>
+        <div className="locked-submission">
+          <span>Your submission - locked</span>
+          <i />
+          <i />
+          <i />
+          <i />
+          <i />
+        </div>
+        <div className="submission-versus">
+          <PlayerStatus name="You (PRO)" state="Submitted" tone="pro" />
+          <strong>VS</strong>
+          <PlayerStatus name={`${duel.opponentName} (CON)`} state="Drafting..." tone="con" />
+        </div>
+      </section>
+      <section className="opponent-time panel">
+        <span>Opponent's time remaining</span>
+        <div className="timer-ring warning">
+          <strong>23:41</strong>
+          <span>Remaining</span>
+        </div>
+        <ProgressLine label="Time Remaining" value="23H 41M" percent={49} warning />
+        <button className="submit-argument evaluate" data-testid="call-verdict" onClick={onEvaluate} disabled={transactionStatus !== null}>
+          {transactionStatus ? 'Processing...' : 'Evaluate Now'}
+        </button>
+      </section>
+      <TopicBlock topic={duel.topic} />
+    </>
+  );
+}
+
+function EvaluatingDuel({ duel }: { duel: Duel }) {
+  return (
+    <>
+      <section className="analysis-card">
+        <div className="analysis-orb">AI</div>
+        <h1>AI is analyzing</h1>
+        <p>GenLayer AI is impartially evaluating both arguments for logical coherence, evidence quality, persuasion, and rhetorical structure.</p>
+      </section>
+      <section className="fighters-row panel">
+        <PlayerStatus name="VerdictX (PRO)" state="Argument submitted" tone="pro" />
+        <strong>VS</strong>
+        <PlayerStatus name={`${duel.opponentName} (CON)`} state="Argument submitted" tone="con" />
+      </section>
+      <section className="criteria-card panel">
+        <span>Evaluation Criteria</span>
+        <div>
+          <em>Logic</em>
+          <em>Evidence</em>
+          <em>Persuasion</em>
+          <em>Accuracy</em>
+          <em>Rhetoric</em>
+        </div>
+      </section>
+    </>
+  );
+}
+
+function CompletedDuel({ duel }: { duel: Duel }) {
+  return (
+    <VerdictReveal
+      winner={duel.winner as 'pro' | 'con'}
+      proScore={duel.pro_score}
+      conScore={duel.con_score}
+      verdictReasoning={duel.verdict_reasoning}
+      winningQuote={duel.verdict_reasoning}
+      factSnapshot={duel.facts_snapshot}
+    />
+  );
+}
+
+function Leaderboard({ rows, walletAddress }: { rows: Debater[]; walletAddress: string | null }) {
+  return (
+    <section className="leaderboard-view">
+      <div className="leaderboard-list">
+        {rows.map((row, index) => (
+          <article className={walletAddress && row.address === walletAddress ? 'leader-row current' : 'leader-row'} key={row.address}>
+            <span className="rank-bg">{index + 1}</span>
+            <div>
+              <strong>{row.name}</strong>
+              <code>{shortAddress(row.address)}</code>
+              <em>{row.bestVerdictQuote}</em>
+            </div>
+            <dl>
+              <dt>W</dt>
+              <dd>{row.wins}</dd>
+              <dt>L</dt>
+              <dd>{row.losses}</dd>
+              <dt>D</dt>
+              <dd>{row.draws}</dd>
+            </dl>
+            <b>{Math.round(winRate(row))}%</b>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function CreateDuelModal({ onClose, onCreate }: { onClose: () => void; onCreate: (topic: string) => void }) {
+  const [topic, setTopic] = useState("Ethereum will flip Bitcoin's market cap by 2028");
+  return (
+    <div className="modal-layer">
+      <section className="modal-card">
+        <h2>New Duel</h2>
+        <label>
+          Topic
+          <textarea value={topic} onChange={(event) => setTopic(event.target.value)} />
+        </label>
+        <div>
+          <button className="save-draft" onClick={onClose}>
+            Cancel
+          </button>
+          <button className="submit-argument" onClick={() => onCreate(topic.trim())}>
+            Create Duel
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ForfeitModal({ onClose, onConfirm }: { onClose: () => void; onConfirm: () => void }) {
+  return (
+    <div className="modal-layer">
+      <section className="forfeit-modal">
+        <div className="warning-mark">!</div>
+        <h2>Forfeit Duel?</h2>
+        <p>This action cannot be undone. You will lose this duel and it will be recorded as a forfeit on your record.</p>
+        <div>
+          <button className="save-draft" onClick={onClose}>
+            Keep Fighting
+          </button>
+          <button className="danger" onClick={onConfirm}>
+            Confirm Forfeit
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function TransactionStatus({ status, onClose }: { status: { hash: string; status: 'pending' | 'confirmed' | 'failed' }; onClose: () => void }) {
+  const statusConfig = {
+    pending: { icon: '⟳', color: '#6366f1', text: 'Transaction Pending', subtext: 'Your transaction is being processed by the network' },
+    confirmed: { icon: '✓', color: '#22c55e', text: 'Transaction Confirmed', subtext: 'Your transaction has been successfully processed' },
+    failed: { icon: '✗', color: '#ef4444', text: 'Transaction Failed', subtext: 'Your transaction could not be processed' },
+  };
+
+  const config = statusConfig[status.status];
+
+  return (
+    <div className="modal-layer">
+      <section className="transaction-modal">
+        <div className="status-icon" style={{ color: config.color }}>
+          {config.icon}
+        </div>
+        <h2 style={{ color: config.color }}>{config.text}</h2>
+        <p>{config.subtext}</p>
+        <div className="tx-hash">
+          <span>Transaction Hash:</span>
+          <code>{status.hash.slice(0, 10)}...{status.hash.slice(-8)}</code>
+        </div>
+        <button className="save-draft" onClick={onClose}>
+          {status.status === 'pending' ? 'Close (Keep Polling)' : 'Close'}
+        </button>
+      </section>
+    </div>
+  );
+}
+
+function TransactionErrorModal({ error, onClose }: { error: TransactionError; onClose: () => void }) {
+  const [showDetails, setShowDetails] = useState(false);
+
+  return (
+    <div className="modal-layer">
+      <section className="transaction-modal error-modal">
+        <div className="status-icon" style={{ color: '#ef4444' }}>
+          ✗
+        </div>
+        <h2 style={{ color: '#ef4444' }}>Transaction Failed</h2>
+        <p>{error.message}</p>
+        <div className="error-details-toggle">
+          <button className="link-btn" onClick={() => setShowDetails(!showDetails)}>
+            {showDetails ? 'Hide Technical Details' : 'Show Technical Details'}
+          </button>
+        </div>
+        {showDetails && (
+          <div className="error-details">
+            <div className="error-detail-row">
+              <span>Error Name:</span>
+              <code>{error.name}</code>
+            </div>
+            <div className="error-detail-row">
+              <span>Function:</span>
+              <code>{error.functionName}</code>
+            </div>
+            <div className="error-detail-row">
+              <span>Contract Address:</span>
+              <code>{error.contractAddress}</code>
+            </div>
+            <div className="error-detail-row">
+              <span>Wallet Address:</span>
+              <code>{error.walletAddress}</code>
+            </div>
+            <div className="error-detail-row">
+              <span>Chain ID:</span>
+              <code>{error.chainId}</code>
+            </div>
+            <div className="error-detail-row">
+              <span>Value:</span>
+              <code>{error.value.toString()}</code>
+            </div>
+            <div className="error-detail-row">
+              <span>Args:</span>
+              <pre>{JSON.stringify(error.args, null, 2)}</pre>
+            </div>
+            {error.cause && (
+              <div className="error-detail-row">
+                <span>Cause:</span>
+                <pre>{JSON.stringify(error.cause, null, 2)}</pre>
+              </div>
+            )}
+            {error.rpcError && (
+              <div className="error-detail-row">
+                <span>RPC Error:</span>
+                <pre>{JSON.stringify(error.rpcError, null, 2)}</pre>
+              </div>
+            )}
+          </div>
+        )}
+        <button className="save-draft" onClick={onClose}>
+          Close
+        </button>
+      </section>
+    </div>
+  );
+}
+
+function LogoMark() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M4 3 14 13M9 3l10 10M4 21l8-8m7 8-7-8" />
+      <path d="M5 14h6v6" />
+    </svg>
+  );
+}
+
+function TopicBlock({ topic }: { topic: string }) {
+  return (
+    <section className="topic-block panel">
+      <span>The Topic</span>
+      <h2>"{topic}"</h2>
+    </section>
+  );
+}
+
+function InfoBox({ label, value, accent }: { label: string; value: string; accent?: boolean }) {
+  return (
+    <div className="info-box">
+      <span>{label}</span>
+      <strong className={accent ? 'accent' : ''}>{value}</strong>
+    </div>
+  );
+}
+
+function ProgressLine({ label, value, percent, warning }: { label: string; value: string; percent: number; warning?: boolean }) {
+  return (
+    <div className="progress-line">
+      <div>
+        <span>{label}</span>
+        <strong>{value}</strong>
+      </div>
+      <i>
+        <b className={warning ? 'warning' : ''} style={{ width: `${percent}%` }} />
+      </i>
+    </div>
+  );
+}
+
+function PlayerOrb({ label, tone }: { label: string; tone: 'pro' | 'con' }) {
+  return <span className={`player-orb ${tone}`}>{label}</span>;
+}
+
+function PlayerStatus({ name, state, tone }: { name: string; state: string; tone: 'pro' | 'con' }) {
+  return (
+    <div className="player-status">
+      <PlayerOrb label={tone === 'pro' ? 'VX' : 'CK'} tone={tone} />
+      <div>
+        <strong>{name}</strong>
+        <span>{state}</span>
+      </div>
+    </div>
+  );
+}
+
+function ResultCard({ title, name, argument, winner }: { title: string; name: string; argument: string; winner?: boolean }) {
+  return (
+    <section className={winner ? 'result-card winner' : 'result-card'}>
+      <span>{title}</span>
+      <strong>{name}</strong>
+      <p>{argument || 'Argument text will appear here after finalization.'}</p>
+    </section>
+  );
+}
+
+function winRate(row: Debater) {
+  const total = row.wins + row.losses + row.draws;
+  return total === 0 ? 0 : (row.wins / total) * 100;
+}
+
+function shortAddress(address: string) {
+  if (!address.startsWith('0x') || address.length < 12) return address;
+  return `${address.slice(0, 6)}...${address.slice(-4)}`;
+}
+
+function playBell() {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) return;
+  const ctx = new AudioContextClass();
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.frequency.setValueAtTime(92, ctx.currentTime);
+  osc.frequency.exponentialRampToValueAtTime(48, ctx.currentTime + 1.1);
+  gain.gain.setValueAtTime(0.001, ctx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.7, ctx.currentTime + 0.03);
+  gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 1.25);
+  osc.type = 'sine';
+  osc.connect(gain);
+  gain.connect(ctx.destination);
+  osc.start();
+  osc.stop(ctx.currentTime + 1.3);
+}
+
+declare global {
+  interface Window {
+    ethereum?: any;
+    webkitAudioContext?: typeof AudioContext;
+  }
+}
+
+// Error boundary to display runtime exceptions
+class ErrorBoundary extends Component<{ children: React.ReactNode }, { hasError: boolean; error: Error | null }> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          backgroundColor: '#1a1a1a',
+          color: '#fff',
+          fontFamily: 'monospace',
+          padding: '40px',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 9999
+        }}>
+          <div style={{
+            maxWidth: '800px',
+            width: '100%',
+            backgroundColor: '#2d2d2d',
+            padding: '30px',
+            borderRadius: '12px',
+            border: '2px solid #ff4444',
+            boxShadow: '0 10px 40px rgba(0,0,0,0.5)'
+          }}>
+            <h1 style={{ color: '#ff4444', marginBottom: '20px' }}>⚠️ Runtime Error</h1>
+            <pre style={{
+              backgroundColor: '#1a1a1a',
+              padding: '20px',
+              border: '1px solid #444',
+              borderRadius: '8px',
+              overflow: 'auto',
+              fontSize: '14px',
+              lineHeight: '1.5',
+              marginBottom: '20px'
+            }}>
+              {this.state.error?.toString()}
+              {'\n\n'}
+              {this.state.error?.stack}
+            </pre>
+            <button 
+              onClick={() => window.location.reload()}
+              style={{
+                padding: '12px 24px',
+                backgroundColor: '#ff4444',
+                color: '#fff',
+                border: 'none',
+                borderRadius: '6px',
+                fontSize: '16px',
+                cursor: 'pointer',
+                fontWeight: 'bold'
+              }}
+            >
+              Reload Page
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+// Render the app with WalletProvider and Error Boundary
+createRoot(document.getElementById('root')!).render(
+  <ErrorBoundary>
+    <div style={{ position: 'fixed', top: 0, left: 0, background: 'lime', zIndex: 99999, padding: '10px' }}>
+      React is rendering
+    </div>
+    <WalletProvider>
+      <App />
+    </WalletProvider>
+  </ErrorBoundary>
+);
