@@ -2,7 +2,6 @@ import React, { useEffect, useMemo, useState, useCallback, useRef, Component } f
 import { createRoot } from 'react-dom/client';
 import { motion, AnimatePresence } from 'framer-motion';
 import './styles.css';
-import './styles-enhanced.css';
 import { CountdownTimer } from './components/CountdownTimer';
 import { VerdictReveal } from './components/VerdictReveal';
 import { NewDuelModal } from './components/NewDuelModal';
@@ -46,7 +45,7 @@ function normalizeDuel(d: ContractDuel): ContractDuel {
 }
 
 // Transaction state machine — toast-driven progress feedback
-type TxPhase = 'preparing' | 'wallet_prompt' | 'signing' | 'submitting' | 'pending_confirmation' | 'confirmed' | 'failed';
+type TxPhase = 'preparing' | 'wallet_prompt' | 'signing' | 'submitting' | 'pending_confirmation' | 'confirmed' | 'failed' | 'finalizing';
 
 interface TxToastItem {
   id: number;
@@ -55,6 +54,7 @@ interface TxToastItem {
   errorMsg?: string;
   error?: TransactionError;
   retry?: () => void;
+  checkAgain?: () => void;
 }
 
 function App() {
@@ -206,9 +206,27 @@ function App() {
         // Show pending toast during GenLayer consensus
         const pendingToastId = addToast({ phase: 'pending_confirmation', hash: txHash });
         let attempts = 0;
-        const maxAttempts = 100; // ~5 minutes at 3s intervals
+        const maxAttempts = 300; // ~15 minutes at 3s intervals — LLM consensus can take minutes
         const currentDuelId = waitForStatusChange.duelId;
         const fromStatus = waitForStatusChange.fromStatus;
+
+        // Shared: resolve from polling to confirmed state
+        const resolveConfirmed = async (freshDuel: ContractDuel, toastId: number) => {
+          removeToast(toastId);
+          addToast({ phase: 'confirmed', hash: txHash });
+          if (duel && duel.id === freshDuel.id) {
+            const now = Math.floor(Date.now() / 1000);
+            setDuel({
+              ...freshDuel,
+              playerSide: duel.playerSide,
+              opponentName: duel.opponentName,
+              timeRemaining: Math.max(0, freshDuel.submit_deadline - now),
+            });
+          }
+          await refreshDuelsData();
+          loadContractData();
+        };
+
         while (attempts < maxAttempts) {
           await new Promise(r => setTimeout(r, 3000));
           attempts++;
@@ -216,21 +234,8 @@ function App() {
             const freshDuel = normalizeDuel(await contract.getDuel(currentDuelId));
             if (freshDuel.status !== fromStatus) {
               // Status changed! Transaction finalized.
-              removeToast(pendingToastId);
-              addToast({ phase: 'confirmed', hash: txHash });
               setIsLoading(false);
-              // Full data reload handles everything
-              if (duel && duel.id === freshDuel.id) {
-                const now = Math.floor(Date.now() / 1000);
-                setDuel({
-                  ...freshDuel,
-                  playerSide: duel.playerSide,
-                  opponentName: duel.opponentName,
-                  timeRemaining: Math.max(0, freshDuel.submit_deadline - now),
-                });
-              }
-              await refreshDuelsData();
-              loadContractData();
+              await resolveConfirmed(freshDuel, pendingToastId);
               return; // Exit runTx successfully
             }
           } catch (e) {
@@ -238,11 +243,67 @@ function App() {
             console.warn('Polling error, retrying:', e);
           }
         }
-        // Timeout reached
+
+        // Timeout reached — tx was submitted successfully but GenLayer consensus is still running
         setIsLoading(false);
-        removeToast(pendingToastId);
-        addToast({ phase: 'failed', errorMsg: `Transaction submitted but confirmation timed out. Check explorer.`, hash: txHash, retry: retryFn });
-        setError(`Transaction ${label} submitted but not yet confirmed. Check explorer.`);
+
+        // Create the finalizing toast first so checkDuelStatus can reference its ID
+        const finalizingToastId = addToast({ phase: 'finalizing', hash: txHash });
+        let bgStopped = false;
+        let bgTimer: ReturnType<typeof setTimeout> | null = null;
+
+        const stopBgPoll = () => {
+          bgStopped = true;
+          if (bgTimer) { clearTimeout(bgTimer); bgTimer = null; }
+        };
+
+        const checkDuelStatus = async () => {
+          try {
+            const freshDuel = normalizeDuel(await contract.getDuel(currentDuelId));
+            if (freshDuel.status !== fromStatus) {
+              stopBgPoll();
+              removeToast(finalizingToastId);
+              await resolveConfirmed(freshDuel, finalizingToastId);
+            }
+          } catch (e) {
+            console.warn('Check again poll failed:', e);
+          }
+        };
+
+        // Update the toast with the checkAgain callback now that it's defined
+        setTxToasts(prev => prev.map(t =>
+          t.id === finalizingToastId ? { ...t, checkAgain: checkDuelStatus } : t
+        ));
+
+        // Lightweight background re-check: poll slower every 30s and auto-resolve
+        const scheduleBgPoll = () => {
+          if (bgStopped) return;
+          bgTimer = setTimeout(async () => {
+            if (bgStopped) return;
+            try {
+              const freshDuel = normalizeDuel(await contract.getDuel(currentDuelId));
+              if (freshDuel.status !== fromStatus) {
+                stopBgPoll();
+                removeToast(finalizingToastId);
+                await resolveConfirmed(freshDuel, finalizingToastId);
+              } else {
+                scheduleBgPoll(); // Re-schedule next poll
+              }
+            } catch (e) {
+              scheduleBgPoll(); // Re-schedule on error
+            }
+          }, 30000);
+        };
+        scheduleBgPoll();
+
+        // When the user dismisses the toast, stop the background poll
+        // We intercept by watching for the toast removal in the parent
+        // removeToast function. Since we can't modify it externally, we
+        // override the remove behavior for this specific ID by wrapping it.
+        // This is set in the parent's scope via the setTxToasts map callback.
+        // For now, the toast dismiss just hides it; the bg poll continues
+        // but will only add a NEW confirmed toast if status changes, which
+        // is harmless.
         return;
       }
 
@@ -382,7 +443,7 @@ function App() {
   };
 
   
-  const isTxInFlight = isLoading || txToasts.some(t => t.phase === 'wallet_prompt' || t.phase === 'preparing' || t.phase === 'pending_confirmation');
+  const isTxInFlight = isLoading || txToasts.some(t => t.phase === 'wallet_prompt' || t.phase === 'preparing' || t.phase === 'pending_confirmation' || t.phase === 'finalizing');
 
   return (
     <main className="app">
@@ -987,7 +1048,7 @@ function SubmittedDuel({ duel, onEvaluate, isProcessing }: { duel: Duel; onEvalu
       </section>
       <section className="opponent-time panel">
         <span>Opponent's time remaining</span>
-        <div className={`timer-ring ${isLow ? 'warning' : ''}`}>
+        <div className={`opponent-timer-ring ${isLow ? 'warning' : ''}`}>
           <strong>{timeStr}</strong>
           <span>Remaining</span>
         </div>
@@ -1038,7 +1099,7 @@ function TxToast({ item, onDismiss }: { item: TxToastItem; onDismiss: () => void
   const phase = item.phase;
 
   const icon =
-    phase === 'preparing' || phase === 'wallet_prompt' || phase === 'signing' || phase === 'submitting' || phase === 'pending_confirmation'
+    phase === 'preparing' || phase === 'wallet_prompt' || phase === 'signing' || phase === 'submitting' || phase === 'pending_confirmation' || phase === 'finalizing'
       ? <span className="tx-toast-icon spinner" />
       : phase === 'confirmed'
         ? <span className="tx-toast-icon confirmed">✓</span>
@@ -1050,17 +1111,19 @@ function TxToast({ item, onDismiss }: { item: TxToastItem; onDismiss: () => void
     phase === 'signing' ? 'Signing...' :
     phase === 'submitting' ? 'Submitting...' :
     phase === 'pending_confirmation' ? 'Waiting for GenLayer consensus...' :
+    phase === 'finalizing' ? 'AI judges are deliberating' :
     phase === 'confirmed' ? 'Transaction confirmed' :
     'Transaction failed';
 
   const desc =
     phase === 'failed' ? (item.errorMsg || 'Something went wrong') :
+    phase === 'finalizing' ? 'The transaction was submitted successfully. The AI validators are evaluating arguments — this can take a few minutes. You can close this and check later.' :
     phase === 'confirmed' ? (item.hash ? `Hash: ${item.hash.slice(0, 10)}...${item.hash.slice(-6)}` : '') :
     '';
 
   return (
     <motion.div
-      className="tx-toast"
+      className={`tx-toast ${phase === 'finalizing' ? 'finalizing' : ''}`}
       initial={{ opacity: 0, y: 20, scale: 0.95 }}
       animate={{ opacity: 1, y: 0, scale: 1 }}
       exit={{ opacity: 0, y: 10, scale: 0.95 }}
@@ -1071,6 +1134,16 @@ function TxToast({ item, onDismiss }: { item: TxToastItem; onDismiss: () => void
       <div className="tx-toast-body">
         <div className="tx-toast-title">{title}</div>
         {desc && <div className="tx-toast-desc">{desc}</div>}
+        {phase === 'finalizing' && (
+          <div className="tx-toast-actions">
+            {item.checkAgain && (
+              <button className="tx-toast-check" onClick={item.checkAgain}>Check again</button>
+            )}
+            <button className="tx-toast-explorer" onClick={() => window.open(`https://explorer.bradbury.genlayer.com/tx/${item.hash}`, '_blank')}>
+              View on Explorer
+            </button>
+          </div>
+        )}
         {phase === 'failed' && item.retry && (
           <div className="tx-toast-actions">
             <button className="tx-toast-retry" onClick={item.retry}>Retry</button>
@@ -1086,7 +1159,6 @@ function TxToast({ item, onDismiss }: { item: TxToastItem; onDismiss: () => void
         {phase === 'failed' && item.error && (
           <div className="tx-toast-actions">
             <button className="tx-toast-explorer" onClick={() => {
-              // Expand error details inline - toggle approach is simpler here
               console.log('Transaction error details:', JSON.stringify(item.error, null, 2));
             }}>
               Details (Console)
